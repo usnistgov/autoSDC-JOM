@@ -11,5 +11,5 @@ See [this listing of datasets](data/README.org)
 ## dependencies
 We use [git-subrepo](https://github.com/ingydotnet/git-subrepo) to include shared automation and data analysis libraries.
 
-- autoSDC: scanning droplet cell automation suite https://github.com/usnistgov/autoSDC
-- sizedet: x-ray diffraction peak profile fitting and williamson hall analysis utility
+- [autoSDC](https://github.com/usnistgov/autoSDC): scanning droplet cell automation suite
+- [sizedet](https://github.com/usnistgov/sizedet): x-ray diffraction peak profile fitting and williamson hall analysis utility
