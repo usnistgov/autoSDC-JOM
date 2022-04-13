@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/git-commands/git-subrepo#readme
+;
+[subrepo]
+	remote = git@github.com:usnistgov/sizedet
+	branch = main
+	commit = 43b48df4b86357bf3df06f2d9ca789226c183166
+	parent = 34a4bab113ffd4c089139f1e213f738d44191d39
+	method = merge
+	cmdver = 0.4.3
