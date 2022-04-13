@@ -5,6 +5,8 @@ This repository provides code and data to support reproducibility and extensibil
 
 For details on the SDC platform, see [10.2139/ssrn.4075907](https://dx.doi.org/10.2139/ssrn.4075907)
 
+See [this listing of datasets](data/README.org)
+
 
 ## dependencies
 We use [git-subrepo](https://github.com/ingydotnet/git-subrepo) to include shared automation and data analysis libraries.

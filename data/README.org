@@ -1,0 +1,17 @@
+Several datasets:
+
+* AlNiTi dataset
+[[https://dx.doi.org/10.1021/acscombsci.9b00215][10.1021/acscombsci.9b00215]]
+** e-chem data
+** e-chem analysis
+
+* TiNbTa dataset
+** XRF composition map
+** synchrotron XRD
+*** manual phase annotations
+*** williamson-hall analysis
+** e-chem dataset
+
+* electrodeposition datasets
+** Cu deposition
+** NiCo calibration series
