@@ -1,0 +1,68 @@
+IP	Initial Potential	V	User value -10 to 10 (could be “NOT USED” for Multi-Cycle CV)
+IC	Initial Current	A	User value -.650 to .650
+Vs	Versus		VS OC, VS REF or VS PREVIOUS
+VP	Vertex Potential	V	User value -10 to 10 (could be “NOT USED” for Multi-Vertex Scan)
+VH	Vertex Hold	s	User value
+AH	Acquire data during Vertex Hold		YES or NO
+FP	Final Potential	V	User value -10 to 10 (could be “NOT USED” for Multi-Cycle CV)
+TPP	Time Per Point	s	User value .00001 to ?
+Dur	Duration	s	User value .00001 to ?
+C	Cycles	#	User value
+SH	Step Height	V	User value
+ST	Step Time	s	User value
+L1T	Limit 1 Type		NONE, CURRENT, POTENTIAL or CHARGE
+L1D	Limit 1 Direction		< or >
+L1V	Limit 1 Value		User value
+L2T	Limit 2 Type		NONE, CURRENT, POTENTIAL or CHARGE
+L2D	Limit 2 Direction		< or >
+L2V	Limit 2 Value		User value
+IR	Current Range	*	AUTO, 2A, 200MA, 20MA, 2MA,200UA,20UA,2UA,200NA, 20NA or 4N
+EM	Electrometer		AUTO, SINGLE ENDED or DIFFERENTIAL
+EF	E Filter	**	AUTO, NONE, 200KHZ, 1KHZ, 1KHZ, 100HZ 10HZ, 1HZ
+IF	I Filter	**	AUTO, NONE, 200KHZ, 1KHZ, 1KHZ, 100HZ, 10HZ, 1HZ
+LCO	Leave Cell On		YES or NO
+CTU	Cell To Use		INTERNAL or EXTERNAL
+iRC	enable iR Compensation		ENABLED or DISABLED
+UD	User defined the amount of iR Comp	ohms	User value
+UP	Use previously determined iR Comp		YES or NO
+PE	Pre-Electrolosis time	s	User value
+PP	Pulse Potential	V	User value
+CP	Pulse Current	A	User value
+PH	Pulse Height	V	User value
+SR	Scan Rate	V/s	User value
+F	Frequency	Hz	User value
+PW	Pulse Width	s	User value
+SW	Step Width	s	User value
+T	Threshold Enable		DISABLED or ENABLED
+SL	Start Level	V	User value
+TL	Threshold Level	A	User value
+AM	Acquisition Mode		AUTO, NONE, 4/4 or AVERAGE
+SF	Start Frequency	Hz	User value
+EF	End Frequency	Hz	User value
+AP	Amplitude (Potential)	V	User value
+AC	Amplitude (Current)	A	User value
+PS	Point Spacing		LOGARITHMIC or LINEAR
+NP	Number of Points (Frequencies to test)		User value (When Log value is Points per Decade)
+DQ	Data Quality		User value 0 to 10 (default to 1)
+MD	Measurement Delay	s	User value (Delay between impedance points)
+BW	Bandwidth	***	AUTO, HIGH STABILITY, 1MHZ, 100KHZ, 1KHZ
+RDE	RDE Speed	V	Provides a voltage on the DAC Out, located on rear of instrument
+NA	Number of actions back		Number of actions back in the sequence (1 would repeat the last action)
+I	Number of iterations		How many times to loop
+MA	Maximum Current Range to use	*	AUTO, 2A, 200MA, 20MA, 2MA,200UA,20UA,2UA,200NA, 20NA or 4NA
+MI	Minimum Current Range to use	*	AUTO, 2A, 200MA, 20MA, 2MA,200UA,20UA,2UA,200NA, 20NA or 4NA
+ICR	Initial Current Range	*	AUTO, 2A, 200MA, 20MA, 2MA,200UA,20UA,2UA,200NA, 20NA or 4NA
+NS	Number of Segments	V	User value
+RD	Rest Duration	s	User value (rest time between segments)
+RDR	Rest Drift Rate	mV/min	User value (rest until drift rate is obtained)
+LBW	Low Current Interface Bandwidth	****	AUTO, NORMAL, SLOW, VERY SLOW
+ERS	E Resolution		AUTO, HIGH, LOW
+DTR	Drift Rate	mV/min	User value (limits the drift rate)
+PWR	Power	W	User value
+CD	Current Direction		DISCHARGING OR CHARGING
+CL	Current Limit	A 	User value (absolute)
+RES	Resistance	ohms	User value
+DR	Delta Resolution		User value
+dE	Delta Potential	V 	User value
+dI	Delta Current	A 	User value
+dQ	Delta Charge (Capacity)	C	User value

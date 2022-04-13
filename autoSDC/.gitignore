@@ -1,0 +1,14 @@
+slacktoken.txt
+slack_bot_token.txt
+*.png
+*.json
+data/
+emulation/
+experiments/
+figures/
+notebooks/
+video/
+papers/
+talks/
+**.DS_Store
+**__pycache__/

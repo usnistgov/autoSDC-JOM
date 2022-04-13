@@ -1,0 +1,21 @@
+target_file: data/map.initialize3.csv
+data_dir:
+
+# number of GP-driven measurements to collect
+n_acquisitions: 20
+
+# motion controller speed in m/s
+speed: 1e-3
+
+# use INTERNAL/EXTERNAL cell
+cell: INTERNAL
+
+# add a delay before running each experiment...
+initial_delay: 0
+
+# ease off vertically before moving the cell laterally
+# step height in meters
+delta_z: 5e-3
+
+# press down 50 microns below vertical setpoint to reseat probe after lateral motion
+compress_dz: 5e-5

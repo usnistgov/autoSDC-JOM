@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/git-commands/git-subrepo#readme
+;
+[subrepo]
+	remote = git@github.com:usnistgov/autoSDC
+	branch = blacken
+	commit = 367523b4255b1455e81a3047bc399268aa83013c
+	parent = dd4338f154bf8b06b0a104c84af0269c9efc11d6
+	method = merge
+	cmdver = 0.4.3
