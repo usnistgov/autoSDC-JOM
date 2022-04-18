@@ -82,6 +82,7 @@ class PumpArray:
         fast=False,
         flow_rate=0.5,
         flow_units="ml/min",
+        log_response=True,
     ):
         """pump array.
         What is needed? concentrations and flow rates.
@@ -103,6 +104,7 @@ class PumpArray:
         self.flow_rate = flow_rate
         self.flow_units = flow_units
         self.flow_setpoint = {pump_id: 0.0 for pump_id in self.solutions.keys()}
+        self.log_response = True
 
         # pump initialization
         # self.diameter(self.syringe_diameter)
@@ -111,10 +113,13 @@ class PumpArray:
         total_rate = sum(self.flow_setpoint.values())
         return {key: rate / total_rate for key, rate in self.flow_setpoint.items()}
 
-    def eval(self, command, pump_id=0, ser=None, check_response=False, fast=False):
+    def eval(self, command, pump_id=0, ser=None, check_response=None, fast=False):
         """evaluate a PumpChain command.
         consider batches commands together using connection `ser`
         """
+
+        if check_response is None:
+            check_response = self.log_response
 
         if fast or self.fast:
             command = "@{}".format(command)
@@ -125,12 +130,13 @@ class PumpArray:
         #         self.eval()
 
         command = f"{pump_id} {command}"
-
+        logger.debug(command)
         if ser is not None:
             ser.write(encode(command))
 
             if check_response:
                 s = ser.read(self.buffer_size)
+                logger.debug(s)
                 return s
         else:
             with serial.Serial(
@@ -139,6 +145,7 @@ class PumpArray:
                 ser.write(encode(command))
                 if check_response:
                     s = ser.read(self.buffer_size)
+                    logger.debug(s)
                     return s
 
     def refresh_ui(self, pump_id=0):
@@ -148,6 +155,19 @@ class PumpArray:
     def run(self, pump_id=0):
         print(f"asking pump {pump_id} to run")
         self.eval("run", pump_id=pump_id)
+
+    def bump(self, delay=0.06, fast=True):
+        if delay < 0.05:
+            logger.warn("pump array minimum latency is 50 ms")
+        with serial.Serial(
+            port=self.port, baudrate=self.baud, timeout=self.timeout
+        ) as ser:
+            for pump_id in self.solutions.keys():
+                if self.flow_setpoint[pump_id] > 0:
+                    self.eval("run", pump_id=pump_id, ser=ser, fast=fast)
+                    time.sleep(delay)
+                    self.eval("stop", pump_id=pump_id, ser=ser, fast=fast)
+                    time.sleep(delay)
 
     def run_all(self, fast=False):
         with serial.Serial(

@@ -14,6 +14,7 @@ import sys
 from . import pump
 from . import orion
 from . import reglo
+from . import keithley
 from . import experiment
 from . import microcontroller
 

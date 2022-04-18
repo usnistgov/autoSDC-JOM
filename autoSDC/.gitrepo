@@ -5,8 +5,8 @@
 ;
 [subrepo]
 	remote = git@github.com:usnistgov/autoSDC
-	branch = blacken
-	commit = 367523b4255b1455e81a3047bc399268aa83013c
-	parent = dd4338f154bf8b06b0a104c84af0269c9efc11d6
+	branch = main
+	commit = 43a5534baf26b309cc1518ecb3c8532f7fc5deca
+	parent = 93b47a95b0f063f57becbb0dadea842f594aa32c
 	method = merge
 	cmdver = 0.4.3

@@ -4,6 +4,9 @@ import numpy as np
 import ternary
 from ternary.helpers import simplex_iterator
 
+import mpltern
+from mpltern.ternary.datasets import get_triangular_grid
+
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
@@ -187,6 +190,86 @@ def plot_ocp_model(x, y, ocp, gridpoints, model, query_position, figure_path=Non
         plt.clf()
 
 
+def mpltern_scatter(
+    df,
+    y="FWHM",
+    components=["Al", "Ti", "Ni"],
+    y_name=None,
+    fig=None,
+    panel=None,
+    tripcolor=False,
+    cmap=None,
+    shading="flat",
+    vlimits=(None, None),
+    use_colorbar=True,
+):
+    """ mpltern scatter plot helper """
+    # reorder composition by components
+
+    X = df.loc[:, components]
+
+    if y_name is None:
+        y_name = y
+
+    if type(y) is str:
+        y = df[y]
+
+    if fig is None:
+        fig = plt.gcf()
+    if panel is None:
+        ax = plt.subplot(projection="ternary")
+    elif type(panel) == matplotlib.gridspec.SubplotSpec:
+        ax = fig.add_subplot(panel, projection="ternary")
+    else:
+        ax = panel
+
+    ax.tick_params(labelrotation="horizontal")
+
+    # draw gridlines
+    t, l, r = get_triangular_grid()
+    ax.triplot(t, l, r, color="k", zorder=-100, alpha=0.5, linewidth=0.5)
+
+    if not tripcolor:
+        s = ax.scatter(
+            X.iloc[:, 0],
+            X.iloc[:, 1],
+            X.iloc[:, 2],
+            c=y,
+            cmap=cmap,
+            edgecolors="k",
+            vmin=vlimits[0],
+            vmax=vlimits[1],
+        )
+    else:
+        s = ax.tripcolor(
+            X.iloc[:, 0],
+            X.iloc[:, 1],
+            X.iloc[:, 2],
+            y,
+            shading="flat",
+            cmap=cmap,
+            vmin=vlimits[0],
+            vmax=vlimits[1],
+        )
+
+    axis_order = ["tlabel", "llabel", "rlabel"]
+    axis_labels = {a: component for a, component in zip(axis_order, components)}
+
+    ax.set(**axis_labels)
+
+    # draw the colorbar on an inset
+    if use_colorbar:
+        cax = ax.inset_axes([1.075, 0.1, 0.025, 0.9], transform=ax.transAxes)
+        colorbar = fig.colorbar(s, cax=cax, label=y_name)
+
+    # normalize ticks and remove zero tick label
+    for axis in (ax.taxis, ax.laxis, ax.raxis):
+        axis.set_label_rotation_mode("horizontal")
+        axis.set_ticks([0.2, 0.4, 0.6, 0.8, 1.0])
+
+    return ax
+
+
 def ternary_scatter(
     composition,
     value,
@@ -196,6 +279,8 @@ def ternary_scatter(
     cticks=None,
     s=50,
 ):
+    """ python-ternary version """
+
     scale = 1
     grid = plt.GridSpec(10, 1, wspace=1, hspace=3)
     ax = plt.subplot(grid[:9, :])

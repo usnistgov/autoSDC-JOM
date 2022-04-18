@@ -14,10 +14,12 @@ import numpy as np
 import pandas as pd
 from ruamel import yaml
 from datetime import datetime
+from collections import defaultdict
 from aioconsole import ainput, aprint
 from contextlib import contextmanager, asynccontextmanager
 
-from typing import Any, List, Dict, Optional, Tuple, Union
+from numbers import Number
+from typing import Any, List, Dict, Optional, Tuple, Union, Sequence
 
 import traceback
 
@@ -44,6 +46,7 @@ from asdc import visualization
 from asdc.analysis import EchemData
 
 from asdc.sdc.reglo import Channel
+from asdc.utils import make_circle
 
 potentiostat_id = 17109013
 
@@ -66,7 +69,10 @@ logger = logging.getLogger()
 
 
 def save_plot(results: EchemData, figpath: str, post_slack: bool = True, title=None):
+    """Plot e-chem data and save image file to figures directory.
 
+    Optionally post to slack instance.
+    """
     try:
         results.plot()
     except Exception as err:
@@ -80,25 +86,25 @@ def save_plot(results: EchemData, figpath: str, post_slack: bool = True, title=N
 
 
 def relative_flow(rates):
-    """ convert a dictionary of flow rates to ratios of each component """
+    """Convert a dictionary of flow rates to ratios of each component."""
     total = sum(rates.values())
     if total == 0.0:
         return rates
     return {key: rate / total for key, rate in rates.items()}
 
 
-def to_vec(x, frame):
-    """ convert python iterable coordinates to vector in specified reference frame """
+def to_vec(x: Sequence[Number], frame: CoordSys3D):
+    """Convert python iterable coordinates to vector in specified reference frame."""
     return x[0] * frame.i + x[1] * frame.j
 
 
-def to_coords(x, frame):
-    """ express coordinates in specified reference frame """
+def to_coords(x: Sequence[Number], frame: CoordSys3D):
+    """Express coordinates in specified reference frame."""
     return frame.origin.locate_new("P", to_vec(x, frame))
 
 
 class SDC:
-    """ scanning droplet cell """
+    """Scanning droplet cell interface."""
 
     def __init__(
         self,
@@ -125,19 +131,43 @@ class SDC:
         self.logfile = logfile
         self.configvalues = config
 
+        self.keithley_address = config.get(
+            "keithley_address", "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(2)#USB(2)"
+        )
+        try:
+            self.keithley = sdc.keithley.Keithley(address=self.keithley_address)
+        except:
+            print("failed to connect to keithley -- carrying on")
+
+        # stage initialization
+        self.speed = config.get("speed", 1e-3)
+
         with sdc.position.controller(ip="192.168.10.11") as pos:
             initial_versastat_position = pos.current_position()
             logger.debug(f"initial vs position: {initial_versastat_position}")
 
         self.initial_versastat_position = initial_versastat_position
         self.initial_combi_position = pd.Series(config["initial_combi_position"])
-        self.step_height = config.get("step_height", 0.0)
+        self.v_position = self.initial_versastat_position
+        self.c_position = self.initial_combi_position
+        self.z_contact = None
+        self.initialize_z_position = config.get("initialize_z_position", False)
+
+        # which wafer direction is aligned with position controller +x direction?
+        self.frame_orientation = config.get("frame_orientation", "-y")
+
+        # step height in meters
+        self.step_height = config.get("step_height", 0.01)
         self.cleanup_pause = config.get("cleanup_pause", 0)
         self.cleanup_pulse_duration = config.get("cleanup_pulse_duration", 0)
         self.cell = config.get("cell", "INTERNAL")
-        self.speed = config.get("speed", 1e-3)
+
+        # logging / operations config
         self.data_dir = config.get("data_dir", os.getcwd())
         self.figure_dir = config.get("figure_dir", os.getcwd())
+
+        self.test = config.get("test", False)
+        self.test_cell = config.get("test_cell", False)
         self.confirm = config.get("confirm", True)
         self.confirm_experiment = config.get("confirm_experiment", True)
         self.notify = config.get("notify_slack", True)
@@ -174,17 +204,7 @@ class SDC:
         self.shrink_counter_ratio = config.get("shrink_counter_ratio", 1.3)
         self.shrink_time = config.get("shrink_time", 2)
 
-        self.test = config.get("test", False)
-        self.test_cell = config.get("test_cell", False)
         self.solutions = config.get("solutions")
-
-        self.v_position = self.initial_versastat_position
-        self.c_position = self.initial_combi_position
-
-        self.initialize_z_position = config.get("initialize_z_position", False)
-
-        # which wafer direction is aligned with position controller +x direction?
-        self.frame_orientation = config.get("frame_orientation", "-y")
 
         self.db_file = os.path.join(self.data_dir, config.get("db_file", "testb.db"))
         self.db = dataset.connect(f"sqlite:///{self.db_file}")
@@ -197,22 +217,44 @@ class SDC:
 
         # define reference frames
         # load camera and laser offsets from configuration file
-        camera_offset = config.get("camera_offset", [38.3, -0.4])
-        laser_offset = config.get("laser_offset", [38, -0.3])
-        xray_offset = config.get("xray_offset", [44.74, -4.4035])
+        self.camera_offset = config.get("camera_offset", [38.3, -0.4])
+        self.laser_offset = config.get("laser_offset", [38, -0.3])
+        self.xray_offset = config.get("xray_offset", [44.74, -4.4035])
 
         self.cell_frame = CoordSys3D("cell")
-        self.camera_frame = self.cell_frame.locate_new(
-            "camera",
-            camera_offset[0] * self.cell_frame.i + camera_offset[1] * self.cell_frame.j,
+
+        # store sample/sample holder angle
+        # for use in wafer orientation routines
+        self.sample_angle = 0
+        if self.frame_orientation == "-y":
+            self.sample_angle = 0
+        if self.frame_orientation == "+y":
+            self.sample_angle = sympy.pi
+
+        rel_frame = self.cell_frame.orient_new_axis(
+            "rel_frame", self.sample_angle, self.cell_frame.k
         )
-        self.laser_frame = self.cell_frame.locate_new(
+        self.sample_holder_frame = rel_frame
+
+        # shift relative to the sample holder reference frame
+        # then rotate into the sample reference frame
+        cam = self.sample_holder_frame.locate_new(
+            "_camera",
+            self.camera_offset[0] * rel_frame.i
+            + self.camera_offset[1] * self.sample_holder_frame.j,
+        )
+        self.lab_camera_frame = cam
+        self.camera_frame = cam.orient_new_axis("camera", -self.sample_angle, cam.k)
+
+        self.laser_frame = self.sample_holder_frame.locate_new(
             "laser",
-            laser_offset[0] * self.cell_frame.i + laser_offset[1] * self.cell_frame.j,
+            self.laser_offset[0] * rel_frame.i
+            + self.laser_offset[1] * self.sample_holder_frame.j,
         )
-        self.xray_frame = self.cell_frame.locate_new(
+        self.xray_frame = self.sample_holder_frame.locate_new(
             "xray",
-            xray_offset[0] * self.cell_frame.i + xray_offset[1] * self.cell_frame.j,
+            self.xray_offset[0] * rel_frame.i
+            + self.xray_offset[1] * self.sample_holder_frame.j,
         )
 
         if self.resume:
@@ -255,7 +297,6 @@ class SDC:
             self.phmeter = sdc.orion.PHMeter(orion_port, zmq_pub=zmq_pub)
         except:
             logger.exception("could not connect to the Orion pH meter")
-            # raise
 
         try:
             self.reflectometer = sdc.microcontroller.Reflectometer(port=adafruit_port)
@@ -265,13 +306,28 @@ class SDC:
             self.reflectometer = None
             self.light = None
 
+        # if we explicitly don't want to switch the light, don't
+        if not config.get("toggle_light", True):
+            self.light = None
+
+        # keep track of OCP trace value to run relative scans
+        # without having to chain ametek backend calls explicitly
+        # better to chain experiments and split them at serialization time?
+        self.ocp_hold_value = None
+
+    def register_sample_contact(self):
+        """Run this when the cell is in contact with the sample."""
+        with sdc.position.controller() as pos:
+            self.z_contact = pos.z
+
+        logger.debug(f"registering sample contact: z={self.z_contact}")
+
     def get_last_known_position(self, x_versa, y_versa, resume=False):
         """set up initial cell reference relative to a previous database entry if possible
 
         If not, or if `resume` is False, set initial cell reference from config file. It is
         the operator's responsibility to ensure this initial position matches the physical configuration
         """
-
         # load last known combi position and update internal state accordingly
         refs = pd.DataFrame(self.location_table.all())
 
@@ -289,9 +345,11 @@ class SDC:
                 }
             )
         else:
-            # arbitrarily grab the first position
+            # used to arbitrarily grab the first position
+            # this breaks things if reloading reference frame after
+            # realigning wafer. currently grab most recent position.
             # TODO: verify that this record comes from the current session...
-            ref = refs.iloc[0].to_dict()
+            ref = refs.iloc[-1].to_dict()
             ref["x_versa"] *= 1e3
             ref["y_versa"] *= 1e3
             ref = pd.Series(ref)
@@ -300,8 +358,7 @@ class SDC:
         return ref
 
     def current_versa_xy(self):
-        """ get current stage coords in mm """
-
+        """Get current stage coords in mm."""
         with sdc.position.controller() as pos:
             x_versa = pos.x * 1e3
             y_versa = pos.y * 1e3
@@ -309,9 +366,11 @@ class SDC:
         return x_versa, y_versa
 
     def locate_wafer_center(self):
-        """align reference frames to wafer center
+        """Align reference frames to wafer center.
 
-        identify a circumcircle corresponding three points on the wafer edge
+        Identify a circumcircle corresponding three points on the wafer edge.
+        After coordinate system alignment, this function automatically aligns
+        the cell with the sample center.
         """
         wafer_edge_coords = []
         logger.info(
@@ -326,10 +385,12 @@ class SDC:
         tri = geometry.Triangle(*wafer_edge_coords)
 
         # center is the versascan coordinate such that the camera frame is on the wafer origin
+        # shift this point
         center = np.array(tri.circumcenter, dtype=float)
 
         logger.debug(f"wafer edge coordinates: {wafer_edge_coords}")
         logger.debug(f"center coordinate: {center}")
+        logger.debug(f"wafer diameter: {2000 * tri.circumradius} mm")
 
         # move the stage to focus the camera on the center of the wafer...
         current = np.array(self.current_versa_xy())
@@ -344,40 +405,65 @@ class SDC:
             input("press enter to allow lateral cell motion...")
             stage.update(delta=delta)
 
-        # set up the stage reference frame
-        # relative to the last recorded positions
-        cam = self.camera_frame
+        # take a different approach -- follow resuming code
+        cell = self.cell_frame
+        rel_cell = cell.orient_new_axis("rel_cell", self.sample_angle, cell.k)
 
-        if self.frame_orientation == "-y":
-            _stage = cam.orient_new(
-                "_stage", BodyOrienter(sympy.pi / 2, sympy.pi, 0, "ZYZ")
-            )
-        else:
-            raise NotImplementedError
+        # set up the stage coincident with the canonical sample holder frame
+        _stage = rel_cell.orient_new(
+            "_stage", BodyOrienter(sympy.pi / 2, sympy.pi, 0, "ZYZ")
+        )
 
-        # find the origin of the combi wafer in the coincident stage frame
-        v = 0.0 * cam.i + 0.0 * cam.j
-        combi_origin = v.to_matrix(_stage)
+        # now we have the coordinate that puts the camera over the wafer center
+        # so if we subtract camera offset  from that point we should get the
+        # stage coordinate that centers the cell over the wafer
 
-        # truncate to 2D vector
-        combi_origin = np.array(combi_origin).squeeze()[:-1]
+        # find the origin of the sample holder in the coincident stage frame
+        v = 0.0 * self.lab_camera_frame.i + 0.0 * self.lab_camera_frame.j
+        origin = v.to_matrix(_stage)
 
-        # now find the origin of the stage frame
-        # xv_init = np.array([ref['x_versa'], ref['y_versa']])
-        xv_init = np.array(center)
+        origin = np.array(origin).squeeze()[:-1]  # truncate to 2D
 
-        l = xv_init - combi_origin
-        v_origin = l[1] * cam.i + l[0] * cam.j
+        l = np.array(center) - origin
+        v_origin = l[1] * self.lab_camera_frame.i + l[0] * self.lab_camera_frame.j
 
-        # construct the shifted stage frame
         stage = _stage.locate_new("stage", v_origin)
         self.stage_frame = stage
+
+        # # set up the stage reference frame
+        # # rotate into the relative reference frame...
+        # cam = self.camera_frame.orient_new_axis(
+        #     "camera", self.sample_angle, self.camera_frame.k
+        # )
+
+        # # start assuming orientation -y
+        # _stage = cam.orient_new(
+        #     "_stage", BodyOrienter(sympy.pi / 2, sympy.pi, 0, "ZYZ")
+        # )
+
+        # # find the origin of the combi wafer in the coincident stage frame
+        # v = 0.0 * cam.i + 0.0 * cam.j
+        # combi_origin = v.to_matrix(_stage)
+
+        # # truncate to 2D vector
+        # combi_origin = np.array(combi_origin).squeeze()[:-1]
+
+        # # now find the origin of the stage frame
+        # # xv_init = np.array([ref['x_versa'], ref['y_versa']])
+        # xv_init = np.array(center)
+
+        # l = xv_init - combi_origin
+        # v_origin = l[1] * cam.i + l[0] * cam.j
+
+        # # construct the shifted stage frame
+        # stage = _stage.locate_new("stage", v_origin)
+
+        # self.stage_frame = stage
 
     def sync_coordinate_systems(
         self, orientation=None, register_initial=False, resume=False
     ):
-        """ set up stage reference frames relative to the cell coordinate system """
-
+        """Set up stage reference frames relative to the cell coordinate system."""
         with sdc.position.controller() as pos:
             # map m -> mm
             x_versa = pos.x * 1e3
@@ -389,13 +475,24 @@ class SDC:
         # relative to the last recorded positions
         cell = self.cell_frame
 
-        if orientation == "-y":
-            _stage = cell.orient_new(
-                "_stage", BodyOrienter(sympy.pi / 2, sympy.pi, 0, "ZYZ")
-            )
-        else:
-            raise NotImplementedError
+        # if self.frame_orientation == "-y":
+        #     rel_cell = cell.orient_new_axis("rel_cell", 0, cell.k)
 
+        # if self.frame_orientation == "+y":
+        #     rel_cell = cell.orient_new_axis("rel_cell", sympy.pi, cell.k)
+
+        rel_cell = cell.orient_new_axis("rel_cell", self.sample_angle, cell.k)
+
+        # orient the stage wrt to the wafer holder coordinate system
+        # (the reference frame that doesn't depend on wafer orientation)
+        # this was aligned with orientation -y
+        # this rotation is needed to flip the axes so that the z axis points down
+        # in the current configuration of the stages (+x points east, +y points south)
+        _stage = rel_cell.orient_new(
+            "_stage", BodyOrienter(sympy.pi / 2, sympy.pi, 0, "ZYZ")
+        )
+
+        # older version relied on coincident reference frame shift...
         # find the origin of the combi wafer in the coincident stage frame
         v = ref["x_combi"] * cell.i + ref["y_combi"] * cell.j
         combi_origin = v.to_matrix(_stage)
@@ -404,21 +501,29 @@ class SDC:
         combi_origin = np.array(combi_origin).squeeze()[:-1]
 
         # now find the origin of the stage frame
-        xv_init = np.array([ref["x_versa"], ref["y_versa"]])
+        xv_ref = np.array([ref["x_versa"], ref["y_versa"]])
         if resume:
-            offset = np.array([x_versa, y_versa]) - xv_init
+            offset = np.array([x_versa, y_versa]) - xv_ref
             logger.debug(f"wafer offset: {offset}")
             # xv_init += offset
 
-        l = xv_init - combi_origin
-        v_origin = l[1] * cell.i + l[0] * cell.j
+        # coordinate of wafer center in stage frame
+        l = xv_ref - combi_origin
+
+        v_origin = l[1] * rel_cell.i + l[0] * rel_cell.j
 
         # construct the shifted stage frame
         stage = _stage.locate_new("stage", v_origin)
+
+        if orientation is None:
+            orientation = self.frame_orientation
+
+        stage = _stage.locate_new("stage", v_origin)
+
         return stage
 
     def compute_position_update(self, x: float, y: float, frame: Any) -> np.ndarray:
-        """compute frame update to map combi coordinate to the specified reference frame
+        """Compute frame update to map combi coordinate to the specified reference frame.
 
         Arguments:
             x: wafer x coordinate (`mm`)
@@ -431,13 +536,12 @@ class SDC:
         Important:
             all reference frames are in `mm`; the position controller works with `meters`
         """
-
         P = to_coords([x, y], frame)
         target_coords = np.array(
             P.express_coordinates(self.stage_frame), dtype=np.float
         )
 
-        logger.debug(f"target coordinites: {target_coords}")
+        logger.debug(f"target coordinates: {target_coords}")
 
         with sdc.position.controller() as pos:
             # map m -> mm
@@ -457,7 +561,9 @@ class SDC:
         stage: Any = None,
         threshold: float = 0.0001,
     ):
-        """specify target positions in combi reference frame
+        """Align the sample with target positions `x` and `y`
+
+        Specify any reference `frame`; default is the cell frame
 
         Arguments:
             x: wafer x coordinate (`mm`)
@@ -523,7 +629,6 @@ class SDC:
             - `y`: wafer y coordinate (`mm`)
             - `reference_frame`: target reference frame (`cell`, `camera`, `laser`)
         """
-
         if self.verbose:
             logger.debug(f"local vars (move): {locals()}")
 
@@ -536,12 +641,8 @@ class SDC:
 
         self.move_stage(x, y, frame)
 
-        # @ctl -- update the semaphore in the controller process
-        # await self.dm_controller(web_client, '<@UHNHM7198> update position is set.')
-
     def _scale_flow(self, rates: Dict, nominal_rate: float = 0.5) -> Dict:
-        """ high nominal flow_rate for running out to steady state """
-
+        """Set absolute flow rates given dictionary of solution proportions."""
         total_rate = sum(rates.values())
 
         if total_rate <= 0.0:
@@ -549,136 +650,58 @@ class SDC:
 
         return {key: val * nominal_rate / total_rate for key, val in rates.items()}
 
-    def debug_reglo_droplet(
-        self,
-        prep_height=0.004,
-        wetting_height=0.0011,
-        fill_rate=1.0,
-        fill_counter_ratio=0.75,
-        fill_time=None,
-        shrink_counter_ratio=1.1,
-        shrink_time=None,
-        flow_rate=0.5,
-        target_rate=0.05,
-        cleanup_duration=3,
-        cleanup_pulse_duration=0,
-        stage_speed=0.001,
-    ):
-        """slack bot command for prototyping droplet contact routine
+    # def cleanup_droplet(self):
+    #     """Pick up the cell head and do a rinse and clean."""
+    #     pulse_flowrate = -10.0
 
-        #### json arguments
+    #     # start surface flushing system
+    #     self.reglo.set_rates({Channel.RINSE: 5.0, Channel.NEEDLE: -10.0})
+    #     time.sleep(1)
 
-        | Name             | Type  | Description                                         | Default |
-        |------------------|-------|-----------------------------------------------------|---------|
-        | `prep_height`    | float | z setting to grow the droplet                       |     4mm |
-        | `wetting_height` | float | z setting to wet the droplet to the surface         |   1.1mm |
-        | `fill_rate`      | float | pumping rate during droplet growth                  | 1 mL/min |
-        | `fill_counter_ratio` | float | counterpumping ratio during droplet growth          |    0.75 |
-        | `fill_time`      | float | droplet growth duration (s)                         |    None |
-        | `shrink_counter_ratio` | float | counterpumping ratio during droplet wetting phase   |     1.1 |
-        | `shrink_time`    | float | droplet wetting duration (s)                        |    None |
-        | `flow_rate`      | float | total flow rate during droplet formation (mL/min)   |     0.5 |
-        | `target_rate`    | float | final flow rate after droplet formation  (mL/min)   |    0.05 |
-        | `cleanup`        | float | duration of pre-droplet-formation cleanup siphoning |       0 |
-        | `stage_speed`    | float | stage velocity during droplet formation op          |   0.001 |
+    #     # lift up the cell; don't set it back down
+    #     with sdc.position.controller() as pos:
+    #         pos.update_z(delta=abs(self.wetting_height))
 
-        """
+    #     if self.cleanup_pause > 0:
+    #         cleanup_drain_rate = -10.0
+    #         cleanup_loop_rate = -cleanup_drain_rate / 2
+    #         logger.debug("cleaning up...")
+    #         self.reglo.set_rates(
+    #             {Channel.DRAIN: cleanup_drain_rate, Channel.LOOP: cleanup_loop_rate}
+    #         )
 
-        # stage speed is specified in m/s
-        stage_speed = min(stage_speed, 1e-3)
-        stage_speed = max(stage_speed, 1e-5)
+    #         if self.cleanup_pulse_duration > 0:
+    #             self.reglo.continuousFlow(pulse_flowrate, channel=Channel.DRAIN)
+    #             time.sleep(self.cleanup_pulse_duration)
+    #             self.reglo.continuousFlow(cleanup_drain_rate, channel=Channel.DRAIN)
 
-        # start at zero
-        with sdc.position.sync_z_step(height=wetting_height, speed=stage_speed):
+    #         # run the RINSE channel for only half the cleanup duration
+    #         # to allow the NEEDLE time to clean everything up
+    #         time.sleep(self.cleanup_pause / 2)
+    #         self.reglo.stop(Channel.RINSE)
 
-            if cleanup_duration > 0:
-                # TODO: turn on the needle
-                # make an option to pulse loop and dump simultaneously, same rate opposite directions?
-                logger.debug("cleaning up...")
-                self.reglo.continuousFlow(-10.0, channel=Channel.NEEDLE)
-                self.reglo.stop([Channel.SOURCE, Channel.LOOP])
+    #         time.sleep(self.cleanup_pause / 2)
+    #         self.reglo.stop((Channel.LOOP, Channel.DRAIN))
 
-                if cleanup_pulse_duration > 0:
-                    pulse_flowrate = -1.0
-                    # self.reglo.continuousFlow(pulse_flowrate, channel=Channel.LOOP)
-                    self.reglo.continuousFlow(pulse_flowrate, channel=Channel.DRAIN)
-                    time.sleep(cleanup_pulse_duration)
+    #     return
 
-                self.reglo.stop(channel=Channel.DRAIN)
-
-                time.sleep(cleanup_duration)
-
-            height_difference = prep_height - wetting_height
-            height_difference = max(0, height_difference)
-            with sdc.position.sync_z_step(height=height_difference, speed=stage_speed):
-
-                # counterpump slower to fill the droplet
-                logger.debug("filling droplet")
-                self.reglo.set_rates(
-                    {
-                        Channel.SOURCE: fill_rate,
-                        Channel.LOOP: -fill_rate,
-                        Channel.DRAIN: -fill_counter_ratio * fill_rate,
-                    }
-                )
-
-                fill_start = time.time()
-                if fill_time is None:
-                    input("*filling droplet*: press enter to continue...")
-                else:
-                    time.sleep(fill_time)
-                fill_time = time.time() - fill_start
-
-            # drop down to wetting height
-            # counterpump faster to shrink the droplet
-            logger.debug("shrinking droplet")
-            shrink_flowrate = fill_rate * shrink_counter_ratio
-            self.reglo.continuousFlow(-shrink_flowrate, channel=Channel.DRAIN)
-
-            shrink_start = time.time()
-            if shrink_time is None:
-                input("*shrinking droplet*: press enter to continue...")
-            else:
-                time.sleep(shrink_time)
-            shrink_time = time.time() - shrink_start
-
-            logger.debug("equalizing differential pumping rate")
-            self.reglo.continuousFlow(-fill_rate, channel=Channel.DRAIN)
-
-        # drop down to contact height
-        # instructions['fill_time'] = fill_time
-        # instructions['shrink_time'] = shrink_time
-
-        time.sleep(3)
-
-        # purge...
-        logger.debug("purging solution")
-        purge_rate = 11.0
+    def _purge(self, composition, duration, purge_ratio=0.95, purge_rate=11):
+        """Run the loop with high flow rate at some nominal composition to flush."""
+        rates = self._scale_flow(composition, nominal_rate=purge_rate)
+        self.pump_array.set_rates(rates, start=True, fast=True)
         self.reglo.set_rates(
             {
-                Channel.SOURCE: purge_rate,
-                Channel.LOOP: -purge_rate,
-                Channel.DRAIN: -purge_rate,
+                Channel.LOOP: -purge_ratio * purge_rate,
+                Channel.DRAIN: -purge_ratio * purge_rate,
             }
         )
-
-        time.sleep(30)
+        time.sleep(duration)
 
         # reverse the loop direction
         self.reglo.continuousFlow(6.0, channel=Channel.LOOP)
-
         time.sleep(3)
-
-        # disable source and dump
-        self.reglo.stop([Channel.SOURCE, Channel.DRAIN])
-
-        # step to target flow rate
-        self.reglo.set_rates({Channel.LOOP: target_rate, Channel.NEEDLE: -2.0})
-
-        # message = f"contact routine with {json.dumps(locals())}"
-        # logger.debug(message)
-        logger.debug(f"local vars: {locals}")
-        return
+        self.pump_array.stop_all(fast=True)
+        self.reglo.stop(Channel.DRAIN)
 
     def establish_droplet(
         self,
@@ -697,6 +720,35 @@ class SDC:
             x_wafer: sample x coordinate to move to before forming a droplet
             y_wafer: sample y coordinate to move to before forming a droplet
 
+        ```json
+        {
+          "op": "set_flow",
+          "pH": 10,
+          "flow_rate": 1.25,
+          "precondition_composition": {"H2SO4": 1.0},
+          "precondition_purge_time": 30,
+          "precondition_time": 120,
+          "composition": {"NaCl": 1.0},
+          "purge_time": 60,
+
+        }
+        ```
+
+        | Name             | Type  | Description                                         | Default |
+        |------------------|-------|-----------------------------------------------------|---------|
+        | `prep_height`    | float | z setting to grow the droplet                       |     4mm |
+        | `wetting_height` | float | z setting to wet the droplet to the surface         |   1.1mm |
+        | `fill_rate`      | float | counterpumping ratio during droplet growth          |    0.75 |
+        | `fill_time`      | float | droplet growth duration (s)                         |    None |
+        | `shrink_rate`    | float | counterpumping ratio during droplet wetting phase   |     1.1 |
+        | `shrink_time`    | float | droplet wetting duration (s)                        |    None |
+        | `flow_rate`      | float | total flow rate during droplet formation (mL/min)   |     0.5 |
+        | `target_rate`    | float | final flow rate after droplet formation  (mL/min)   |    0.05 |
+        | `cleanup`        | float | duration of pre-droplet-formation cleanup siphoning |       0 |
+        | `stage_speed`    | float | stage velocity during droplet formation op          |   0.001 |
+        | `solutions`      | List[str]   | list of solutions to pump with                |   None  |
+
+
         """
 
         def check_syringe_levels(
@@ -713,94 +765,108 @@ class SDC:
             to_refill = [key for key, value in surplus.items() if value < headroom]
             return to_refill
 
-        relative_rates = flow_instructions.get("relative_rates")
-        target_rate = float(flow_instructions.get("flow_rate", 1.0))
-        purge_time = float(flow_instructions.get("purge_time", 30))
-        pH_target = float(flow_instructions.get("pH"))
-
         # some hardcoded configuration
         pulse_flowrate = -10.0
         purge_rate = 11.0
         purge_ratio = 0.95
-        purge_rates = self._scale_flow(relative_rates, nominal_rate=purge_rate)
+
+        composition = flow_instructions.get("composition")
+        target_rate = float(flow_instructions.get("flow_rate", 1.0))
+        purge_time = float(flow_instructions.get("purge_time", 30))
+        pH_target = float(flow_instructions.get("pH"))
+
+        purge_rates = self._scale_flow(composition, nominal_rate=purge_rate)
 
         # compute required volumes in mL
         volume_needed = {
             key: purge_time * rate / 60 for key, rate in purge_rates.items()
         }
+
+        # optionally: condition with a different solution
+        precondition = False
+        precondition_composition = flow_instructions.get("precondition_composition")
+        if precondition_composition is not None:
+            precondition = True
+            precondition_time = flow_instructions.get("precondition_time", 120)
+            precondition_purge_time = flow_instructions.get(
+                "precondition_purge_time", 30
+            )
+            _rates = self._scale_flow(precondition_composition, nominal_rate=purge_rate)
+            precondition_volume_needed = {
+                key: precondition_purge_time * rate / 60 for key, rate in _rates.items()
+            }
+            volume_needed = defaultdict(float, volume_needed)
+            for key, value in precondition_volume_needed.items():
+                volume_needed[key] += value
+
+            setup_composition = precondition_composition
+        else:
+            setup_composition = composition
+
         logger.info(f"solution push target: {volume_needed}")
 
-        levels = self.pump_array.levels()
-        logger.info(f"current solution levels: {levels}")
+        # levels = self.pump_array.levels()
+        # logger.info(f"current solution levels: {levels}")
 
-        to_refill = check_syringe_levels(volume_needed, levels)
+        # to_refill = check_syringe_levels(volume_needed, levels)
 
-        while len(to_refill) > 0:
-            pump_ids = [
-                f"{name} (pump {self.pump_array.get_pump_id(name)})"
-                for name in to_refill
-            ]
-            pump_ids = ", ".join(pump_ids)
-            logger.warning(f"Refill and reset syringes: {pump_ids}")
-            input("refill and reset pumps to proceed")
-            levels = self.pump_array.levels()
-            to_refill = check_syringe_levels(volume_needed, levels)
+        # while len(to_refill) > 0:
+        #     pump_ids = [
+        #         f"{name} (pump {self.pump_array.get_pump_id(name)})"
+        #         for name in to_refill
+        #     ]
+        #     pump_ids = ", ".join(pump_ids)
+        #     logger.warning(f"Refill and reset syringes: {pump_ids}")
+        #     input("refill and reset pumps to proceed")
+        #     levels = self.pump_array.levels()
+        #     to_refill = check_syringe_levels(volume_needed, levels)
 
         # droplet workflow -- start at zero
         logger.debug("starting droplet workflow")
 
+        # start surface flushing system
         self.reglo.set_rates({Channel.RINSE: 5.0, Channel.NEEDLE: -10.0})
         time.sleep(1)
 
-        with sdc.position.sync_z_step(height=self.wetting_height, speed=self.speed):
+        # with sdc.position.sync_z_step(height=self.wetting_height, speed=self.speed):
 
-            if self.cleanup_pause > 0:
-                logger.debug("cleaning up...")
-                self.reglo.set_rates({Channel.DRAIN: -10.0})
-                self.reglo.stop(Channel.LOOP)
+        # sample alignment and droplet formation
+        with sdc.position.controller(speed=self.speed) as stage:
 
-                if self.cleanup_pulse_duration > 0:
-                    self.reglo.continuousFlow(pulse_flowrate, channel=Channel.DRAIN)
-                    time.sleep(self.cleanup_pulse_duration)
+            # sample alignment
+            if x_wafer is not None and y_wafer is not None:
+                self.move_stage(x_wafer, y_wafer, self.cell_frame)
 
-                    self.reglo.stop(channel=Channel.DRAIN)
+            # go to droplet height
+            stage.z = self.z_contact + self.droplet_height
 
-                time.sleep(self.cleanup_pause / 2)
-                self.reglo.stop(Channel.RINSE)
-                time.sleep(self.cleanup_pause / 2)
-                self.reglo.stop(Channel.DRAIN)
+            logger.debug("starting rinse")
+            self.reglo.set_rates({Channel.RINSE: 5.0})
+            time.sleep(2)
 
-            height_difference = self.droplet_height - self.wetting_height
-            height_difference = max(0, height_difference)
-            with sdc.position.sync_z_step(
-                height=height_difference, speed=self.speed
-            ) as stage:
+            # counterpump slower to fill the droplet
+            logger.debug("filling droplet")
+            cell_fill_rates = self._scale_flow(
+                setup_composition, nominal_rate=self.fill_rate
+            )
 
-                if x_wafer is not None and y_wafer is not None:
-                    self.move_stage(x_wafer, y_wafer, self.cell_frame)
+            # howie wants to turn on the drain and syringe array together
+            # purge the extra leg of loop for a bit
+            self.pump_array.set_rates(cell_fill_rates, start=True, fast=True)
+            self.reglo.continuousFlow(
+                -self.fill_counter_ratio * self.fill_rate, channel=Channel.DRAIN
+            )
+            time.sleep(10)
+            self.reglo.continuousFlow(-self.fill_rate, channel=Channel.LOOP)
 
-                logger.debug("starting rinse")
-                self.reglo.set_rates({Channel.RINSE: 5.0})
-                time.sleep(2)
-
-                # counterpump slower to fill the droplet
-                logger.debug("filling droplet")
-                cell_fill_rates = self._scale_flow(
-                    relative_rates, nominal_rate=self.fill_rate
-                )
-                self.pump_array.set_rates(cell_fill_rates, start=True, fast=True)
-                self.reglo.set_rates(
-                    {
-                        # Channel.SOURCE: self.fill_rate,
-                        Channel.LOOP: -self.fill_rate,
-                        Channel.DRAIN: -self.fill_counter_ratio * self.fill_rate,
-                    }
-                )
-                time.sleep(self.fill_time / 2)
-                self.reglo.stop(Channel.RINSE)
-                time.sleep(self.fill_time / 2)
+            # stop the RINSE channel halfway through
+            time.sleep(self.fill_time / 2)
+            self.reglo.stop(Channel.RINSE)
+            time.sleep(self.fill_time / 2)
 
             # drop down to wetting height
+            stage.z = self.z_contact + self.wetting_height
+
             # counterpump faster to shrink the droplet
             logger.debug("differentially pumping to shrink the droplet")
             shrink_flowrate = self.fill_rate * self.shrink_counter_ratio
@@ -810,34 +876,33 @@ class SDC:
             logger.debug("equalizing differential pumping rate")
             self.reglo.continuousFlow(-self.fill_rate, channel=Channel.DRAIN)
 
-        # drop down to contact...
-        time.sleep(3)
+            # drop down to contact...
+            stage.z = self.z_contact
+            time.sleep(3)
 
         # purge... (and monitor pH)
         if logfile is None:
             logfile = os.path.join(self.data_dir, "purge.csv")
 
         with self.phmeter.monitor(interval=1, logfile=logfile):
-            logger.debug("purging solution")
-            self.pump_array.set_rates(purge_rates, start=True, fast=True)
-            self.reglo.set_rates(
-                {
-                    Channel.LOOP: -purge_ratio * purge_rate,
-                    Channel.DRAIN: -purge_ratio * purge_rate,
-                }
+
+            if precondition:
+                logger.debug("purging with preconditioning solution")
+                self._purge(
+                    precondition_composition,
+                    precondition_purge_time,
+                    purge_ratio=purge_ratio,
+                    purge_rate=purge_rate,
+                )
+                logger.debug("preconditioning")
+                time.sleep(precondition_time)
+
+            logger.debug("purging with target solution")
+            self._purge(
+                composition, purge_time, purge_ratio=purge_ratio, purge_rate=purge_rate
             )
-
-            time.sleep(purge_time)
-
-            # reverse the loop direction
-            self.reglo.continuousFlow(6.0, channel=Channel.LOOP)
-
-            time.sleep(3)
-
             logger.debug(f"stepping flow rates to {target_rate}")
             self.reglo.set_rates({Channel.LOOP: target_rate, Channel.NEEDLE: -2.0})
-            self.pump_array.stop_all(fast=True)
-            self.reglo.stop(Channel.DRAIN)
 
         current_pH_reading = self.phmeter.pH[-1]
         if pH_target is not None:
@@ -856,76 +921,6 @@ class SDC:
 
         return
 
-    def syringe_establish_droplet(
-        self, x_wafer: float, y_wafer: float, flow_instructions: Dict
-    ):
-        """ align the stage with a sample point, form a droplet, and flush lines if needed """
-
-        rates = flow_instructions.get("rates")
-        cell_fill_rates = self._scale_flow(rates, nominal_rate=0.5)
-        line_flush_rates = self._scale_flow(rates, nominal_rate=1.0)
-
-        # if relative flow rates don't match, purge solution
-        line_flush_duration = flow_instructions.get("hold_time", 0)
-        line_flush_needed = relative_flow(rates) != relative_flow(
-            self.pump_array.flow_setpoint
-        )
-
-        # droplet workflow -- start at zero
-        logger.debug("starting droplet workflow")
-        with sdc.position.sync_z_step(
-            height=self.wetting_height, speed=self.speed
-        ) as stage:
-
-            if self.cleanup_pause > 0:
-                logger.debug("cleaning up...")
-                self.pump_array.stop_all(counterbalance="full", fast=True)
-                time.sleep(self.cleanup_pause)
-
-            self.move_stage(x_wafer, y_wafer, self.cell_frame)
-
-            height_difference = self.droplet_height - self.wetting_height
-            height_difference = max(0, height_difference)
-            with sdc.position.sync_z_step(height=height_difference, speed=self.speed):
-
-                # counterpump slower to fill the droplet
-                logger.debug("differentially pumping to grow the droplet")
-                self.pump_array.set_rates(
-                    cell_fill_rates,
-                    counterpump_ratio=self.fill_ratio,
-                    start=True,
-                    fast=True,
-                )
-                time.sleep(self.fill_time)
-
-            # drop down to wetting height
-            # counterpump faster to shrink the droplet
-            logger.debug("differentially pumping to shrink the droplet")
-            self.pump_array.set_rates(
-                cell_fill_rates,
-                counterpump_ratio=self.shrink_ratio,
-                start=True,
-                fast=True,
-            )
-            time.sleep(self.shrink_time)
-
-            logger.debug("equalizing differential pumping rate")
-            self.pump_array.set_rates(
-                line_flush_rates, counterpump_ratio=0.95, start=True, fast=True
-            )
-
-        # flush lines with cell in contact
-        if line_flush_needed:
-            logger.debug("performing line flush")
-            time.sleep(line_flush_duration)
-
-        time.sleep(3)
-
-        logger.debug(f"stepping flow rates to {rates}")
-        self.pump_array.set_rates(rates, counterpump_ratio=0.95, start=True, fast=True)
-
-        return
-
     def quick_expt(
         self,
         instructions: Union[Dict, List[Dict]],
@@ -933,8 +928,7 @@ class SDC:
         plot=True,
         remeasure_ocp=False,
     ):
-        """ run a one-off e-chem sequence without touching the stages or pumps """
-
+        """Run a one-off e-chem sequence without touching the stages or pumps."""
         logger.info(f"running experiment {instructions}")
 
         if type(instructions) is dict:
@@ -1004,13 +998,13 @@ class SDC:
         if block:
             message = f"*confirm*: {message}"
 
-        logger.info(message)
+            logger.info(message)
 
         if block:
             input("press enter to allow running the experiment...")
 
-    def run_experiment(self, instructions: List[Dict], plot=True):
-        """run an SDC experiment
+    def run_experiment(self, instructions: Sequence[Dict], plot: bool = True):
+        """Run an SDC experiment sequence
 
         args should contain a sequence of SDC experiments -- basically the "instructions"
         segment of an autoprotocol protocol
@@ -1019,6 +1013,8 @@ class SDC:
         TODO: define heuristic checks (and hard validation) as part of the experimental protocol API
         # heuristic check for experimental error signals?
         """
+        # reset OCP reference value
+        self.ocp_hold_value = None
 
         # check for an instruction group name/intent
         intent = instructions[0].get("intent")
@@ -1027,10 +1023,14 @@ class SDC:
             header = instructions[0]
             instructions = instructions[1:]
 
-        x_combi, y_combi = header.get("x"), header.get("y")
+        x_combi, y_combi = header.get("x", None), header.get("y", None)
 
         flow_instructions = instructions[0]
         self.establish_droplet(flow_instructions, x_combi, y_combi)
+
+        # hack? set wafer coords to zero if they are not specified
+        if x_combi is None and y_combi is None:
+            x_combi, y_combi = 0, 0
 
         meta = {
             "intent": intent,
@@ -1065,10 +1065,15 @@ class SDC:
 
                     logger.info(f"running {opname}")
 
-                    experiment = sdc.experiment.from_command(instruction)
+                    experiment, instrument = sdc.experiment.from_command(instruction)
 
                     if experiment is None:
                         continue
+
+                    # set up data-dependent experiments?
+                    # check if voltage reference is vs hold (good name for this?)
+                    # load values from db/disk -- alternatively previous experiment sets it?
+                    experiment.update_relative_scan(self.ocp_hold_value)
 
                     metadata = {
                         "op": opname,
@@ -1076,12 +1081,20 @@ class SDC:
                         "datafile": f"{basename}_{sequence_id}_{opname}.csv",
                     }
 
-                    results, m = pstat.run(experiment)
+                    if instrument == "versastat":
+                        results, m = pstat.run(experiment)
+                    elif instrument == "keithley":
+                        results, m = self.keithley.run(experiment)
 
                     try:
                         status = results.check_quality()
                     except Exception as err:
                         logger.error(f"data check: {err}")
+
+                    if experiment.name == "OpenCircuit":
+                        # record open circuit potential after hold for
+                        # reference by downstream experiments
+                        self.ocp_hold_value = results["potential"].iloc[-5:].mean()
 
                     metadata.update(m)
 
@@ -1110,6 +1123,80 @@ class SDC:
 
         logger.info(f"finished experiment {location_id}: {summary}")
 
+        # a bit inflexible? post-experiment hooks
+        post = header.get("post", [])
+
+        for p in post:
+            if p == "clean":
+                self.clean_droplet()
+            if p == "image":
+                self.collect_image(location_id)
+
+    def clean_droplet(self):
+        """Just clean up without a rinse.
+
+        Assumes cell is in contact with sample.
+        Add a circular trajectory.
+        """
+        pulse_flowrate = -10.0
+
+        # lift up the cell; don't set it back down
+        with sdc.position.controller(speed=self.speed) as stage:
+
+            # note: units are in meters!
+            # this should be the same as self.z_contact + self.wetting_height
+            stage.z += abs(self.wetting_height)
+
+            # current stage coords in mm
+            x_versa = 1e3 * stage.x
+            y_versa = 1e3 * stage.y
+
+        # plan a circular trajectory with 2mm radius
+        c = make_circle(r=2, n=30)
+        stage_targets = np.array([x_versa, y_versa]) + c
+        n_segments, _ = stage_targets.shape
+
+        if self.cleanup_pause > 0:
+            cleanup_drain_rate = -10.0
+            cleanup_loop_rate = -cleanup_drain_rate / 2
+            logger.debug("cleaning up...")
+            self.reglo.set_rates(
+                {Channel.DRAIN: cleanup_drain_rate, Channel.LOOP: cleanup_loop_rate}
+            )
+
+            if self.cleanup_pulse_duration > 0:
+                self.reglo.continuousFlow(pulse_flowrate, channel=Channel.DRAIN)
+                time.sleep(self.cleanup_pulse_duration)
+                self.reglo.continuousFlow(cleanup_drain_rate, channel=Channel.DRAIN)
+
+            # move the sample in a circular trajectory to help cleanup
+            # time.sleep(self.cleanup_pause)
+            with sdc.position.controller(speed=self.speed) as stage:
+                for stage_target in stage_targets:
+                    self.move_stage(
+                        stage_target[0], stage_target[1], self.stage_frame, stage=stage
+                    )
+                    time.sleep(self.cleanup_pause / n_segments)
+
+            self.reglo.stop((Channel.LOOP, Channel.DRAIN))
+
+    def collect_image(self, location_id):
+        """Collect image for sample `location_id`.
+
+        Leaves the cell at image capture configuration.
+        """
+        sample = self.db["location"].find_one(id=location_id)
+        x_combi = sample["x_combi"]
+        y_combi = sample["y_combi"]
+
+        with sdc.position.controller(speed=self.speed) as stage:
+            # update target z coordinate in meters
+            stage.z = self.z_contact + abs(self.characterization_height)
+
+            # align the surface cam with specified sample
+            self.move_stage(x_combi, y_combi, self.camera_frame)
+            self.capture_image_new(sample["id"])
+
     def run_characterization(self, args: str):
         """perform cell cleanup and characterization
 
@@ -1124,7 +1211,6 @@ class SDC:
         ]
 
         """
-
         # the header block should contain the `experiment_id`
         # for the spots to be characterized
         instructions = json.loads(args)
@@ -1151,7 +1237,7 @@ class SDC:
                 self.establish_droplet(flow_instructions, x_combi, y_combi)
 
         # run cleanup and optical characterization
-        self.pump_array.stop_all(counterbalance="full", fast=True)
+        self.pump_array.stop_all(fast=True)
         time.sleep(0.25)
 
         characterization_ops = set(i.get("op") for i in instructions if "op" in i)
@@ -1238,7 +1324,6 @@ class SDC:
         the header instruction should contain a list of primary keys
         corresponding to sample points that should be characterized.
         """
-
         # the header block should contain
         instructions = json.loads(args)
         experiment_id = instructions.get("experiment_id")
@@ -1267,126 +1352,13 @@ class SDC:
             # move back to the cell frame for the second spot
             self.move_stage(x_combi, y_combi, self.cell_frame)
 
-    def droplet(self, args: str):
-        """slack bot command for prototyping droplet contact routine
-
-        #### json arguments
-
-        | Name             | Type  | Description                                         | Default |
-        |------------------|-------|-----------------------------------------------------|---------|
-        | `prep_height`    | float | z setting to grow the droplet                       |     4mm |
-        | `wetting_height` | float | z setting to wet the droplet to the surface         |   1.1mm |
-        | `fill_rate`      | float | counterpumping ratio during droplet growth          |    0.75 |
-        | `fill_time`      | float | droplet growth duration (s)                         |    None |
-        | `shrink_rate`    | float | counterpumping ratio during droplet wetting phase   |     1.1 |
-        | `shrink_time`    | float | droplet wetting duration (s)                        |    None |
-        | `flow_rate`      | float | total flow rate during droplet formation (mL/min)   |     0.5 |
-        | `target_rate`    | float | final flow rate after droplet formation  (mL/min)   |    0.05 |
-        | `cleanup`        | float | duration of pre-droplet-formation cleanup siphoning |       0 |
-        | `stage_speed`    | float | stage velocity during droplet formation op          |   0.001 |
-        | `solutions`      | List[str]   | list of solutions to pump with                |   None  |
-
-        """
-        instructions = json.loads(args)
-
-        prep_height = max(0, instructions.get("height", 0.004))
-        wetting_height = max(0, instructions.get("wetting_height", 0.0011))
-        fill_ratio = instructions.get("fill_rate", 0.75)
-        fill_time = instructions.get("fill_time", None)
-        shrink_ratio = instructions.get("shrink_rate", 1.1)
-        shrink_time = instructions.get("shrink_time", None)
-        flow_rate = instructions.get("flow_rate", 0.5)
-        target_rate = instructions.get("target_rate", 0.05)
-        cleanup_duration = instructions.get("cleanup", 0)
-        stage_speed = instructions.get("stage_speed", self.speed)
-        solutions = instructions.get("solutions")
-
-        # stage speed is specified in m/s
-        stage_speed = min(stage_speed, 1e-3)
-        stage_speed = max(stage_speed, 1e-5)
-
-        # just pump from the first syringe pump
-        # solution = next(iter(self.solutions))
-        if solutions is None:
-            solution = self.solutions[0]
-            s = next(iter(solution))
-            _rates = {s: flow_rate}
-        elif type(solutions) is list:
-            _rates = {s: 1.0 for s in solutions}
-        elif type(solutions) is dict:
-            _rates = solutions
-
-        rates = self._scale_flow(_rates, nominal_rate=flow_rate)
-        target_rates = self._scale_flow(_rates, nominal_rate=target_rate)
-
-        logger.info(f"rates: {rates}")
-        logger.info(f"target_rates: {target_rates}")
-
-        # start at zero
-        with sdc.position.z_step(height=wetting_height, speed=stage_speed):
-
-            if cleanup_duration > 0:
-                logger.info("cleaning up...")
-                self.pump_array.stop_all(counterbalance="full", fast=True)
-                time.sleep(cleanup_duration)
-
-            height_difference = prep_height - wetting_height
-            height_difference = max(0, height_difference)
-            with sdc.position.z_step(height=height_difference, speed=stage_speed):
-
-                # counterpump slower to fill the droplet
-                logger.info("filling droplet")
-                self.pump_array.set_rates(
-                    rates, counterpump_ratio=fill_ratio, start=True, fast=True
-                )
-                fill_start = time.time()
-                if fill_time is None:
-                    input("*filling droplet*: press enter to continue...")
-                else:
-                    time.sleep(fill_time)
-                fill_time = time.time() - fill_start
-
-            # drop down to wetting height
-            # counterpump faster to shrink the droplet
-            logger.info("shrinking droplet")
-            self.pump_array.set_rates(rates, counterpump_ratio=shrink_ratio, fast=True)
-            shrink_start = time.time()
-            if shrink_time is None:
-                input("*shrinking droplet*: press enter to continue...")
-            else:
-                time.sleep(shrink_time)
-            shrink_time = time.time() - shrink_start
-
-            logger.info("equalizing differential pumping rate")
-            self.pump_array.set_rates(rates, fast=True, start=True)
-
-        # drop down to contact height
-        instructions["fill_time"] = fill_time
-        instructions["shrink_time"] = shrink_time
-
-        time.sleep(3)
-
-        logger.info(f"stepping flow rates to {rates}")
-        self.pump_array.set_rates(
-            target_rates, counterpump_ratio=0.95, fast=True, start=True
-        )
-
-        message = f"contact routine with {json.dumps(instructions)}"
-        web_client.chat_postMessage(
-            channel="#asdc", text=message, icon_emoji=":sciencebear:"
-        )
-
-        return
-
     def flag(self, primary_key: int):
-        """ mark a datapoint as bad """
-
+        """Mark a datapoint as bad."""
         with self.db as tx:
             tx["experiment"].update({"id": primary_key, "flag": True}, ["id"])
 
     def coverage(self, primary_key: int, coverage_estimate: float):
-        """ record deposition coverage on (0.0,1.0). """
-
+        """Record deposition coverage on (0.0,1.0)."""
         if coverage_estimate < 0.0 or coverage_estimate > 1.0:
             _slack.post_message(
                 f":terriblywrong: *error:* coverage estimate should be in the range (0.0, 1.0)"
@@ -1398,7 +1370,7 @@ class SDC:
                 )
 
     def refl(self, primary_key: int, reflectance_readout: float):
-        """ record the reflectance of the deposit (0.0,inf). """
+        """Record the reflectance of the deposit (0.0,inf)."""
 
         if reflectance_readout < 0.0:
             _slack.post_message(
@@ -1413,7 +1385,7 @@ class SDC:
     def reflectance_linescan(
         self, stepsize: float = 0.00015, n_steps: int = 32, stage: Any = None
     ) -> Tuple[List[float], List[float]]:
-        """perform a laser reflectance linescan
+        """Perform a laser reflectance linescan.
 
         Arguments:
             stepsize: distance between linescan measurements (meters)
@@ -1454,7 +1426,7 @@ class SDC:
         return mean, var
 
     def reflectance(self, primary_key=None, stage=None):
-
+        """Acquire reflectance linescan data for sample `primary_key`."""
         # get the stage position at the start of the linescan
         with sdc.position.controller() as s:
             metadata = {"reflectance_xv": s.x, "reflectance_yv": s.y}
@@ -1481,16 +1453,21 @@ class SDC:
     @contextmanager
     def light_on(self):
         """ context manager to toggle the light on and off for image acquisition """
-        self.light.set("on")
+        if self.light is not None:
+            self.light.set("on")
+        else:
+            logger.debug("sample light relay not connected.")
+
         yield
-        self.light.set("off")
+
+        if self.light is not None:
+            self.light.set("off")
 
     def capture_image(self, primary_key=None):
         """capture an image from the webcam.
 
         pass an experiment index to serialize metadata to db
         """
-
         with self.light_on():
             camera = cv2.VideoCapture(self.camera_index)
             # give the camera enough time to come online before reading data...
@@ -1523,15 +1500,52 @@ class SDC:
 
         return
 
-    def bubble(self, primary_key: int):
-        """ record a bubble in the deposit """
+    def capture_image_new(self, sample_id):
+        """capture an image from the webcam.
 
+        pass an experiment index to serialize metadata to db
+        """
+        with self.light_on():
+            camera = cv2.VideoCapture(self.camera_index)
+            # give the camera enough time to come online before reading data...
+            time.sleep(0.5)
+            status, frame = camera.read()
+
+        # BGR --> RGB format
+        frame = frame[..., ::-1].copy()
+
+        if sample_id is not None:
+
+            image_name = f"deposit_pic_{sample_id:03d}.png"
+
+            with sdc.position.controller() as stage:
+                metadata = {
+                    "op": "image",
+                    "location_id": sample_id,
+                    "image_xv": stage.x,
+                    "image_yv": stage.y,
+                    "datafile": image_name,
+                    "image_name": image_name,
+                }
+
+            with self.db as tx:
+                tx["experiment"].insert(metadata)
+
+        else:
+            image_name = "test-image.png"
+
+        imageio.imsave(os.path.join(self.data_dir, image_name), frame)
+        camera.release()
+
+        return
+
+    def bubble(self, primary_key: int):
+        """Record a bubble in the deposit."""
         with self.db as tx:
             tx["experiment"].update({"id": primary_key, "has_bubble": True}, ["id"])
 
     def comment(self, primary_key: int, text: str):
-        """ add a comment """
-
+        """Add a comment associated with experiment record `primary_key`."""
         row = self.experiment_table.find_one(id=primary_key)
 
         if row["comment"]:
@@ -1546,9 +1560,10 @@ class SDC:
 
     def stop_pumps(self):
         """ shut off the syringe and counterbalance pumps """
-        self.pump_array.stop_all(counterbalance="off")
+        self.pump_array.stop_all()
 
     def load_experiments(self, instructions_file=None):
+        """Load experiment sequence from json datafile `instructions_file`."""
         root_dir = os.path.dirname(self.data_dir)
         if instructions_file is None:
             instructions_file = os.path.join(root_dir, "instructions.json")
@@ -1563,22 +1578,32 @@ class SDC:
 
         return instructions
 
-    def batch_execute_experiments(self, instructions_file=None):
+    def batch_execute_experiments(self, instructions_file=None, capture_images=False):
+        """Execute all experiments from a json file."""
+        # remember z stage coordinate
+        self.register_sample_contact()
 
         instructions = self.load_experiments(instructions_file)
 
         for instruction_chain in instructions:
             logger.debug(json.dumps(instruction_chain))
             self.run_experiment(instruction_chain)
+            if capture_images:
+                self.collect_image(instruction_chain[0])
 
         return
 
-    def purge_cell(self):
+    def run_hold(self, potential=0.0):
+        """One-off helper function to run quick potentiostatic hold."""
+        instructions = self.default_experiment
+        for i in instructions:
+            if "op" in i and i["op"] == "potentiostatic":
+                i["initial_potential"] = potential
 
-        return
+        self.run_experiment(instructions)
 
     def droplet_video(self):
-
+        """One-off helper function to acquire video of the droplet formation procedure."""
         flowrates = {"flow_rate": 1.0, "relative_rates": {"H2O": 1.0}, "purge_time": 15}
 
         points = [[0, 15], [15, 15], [15, 0], [0, 0]]
@@ -1590,8 +1615,7 @@ class SDC:
 
 
 def sdc_client(config_file: str, resume: bool, zmq_pub: bool, verbose: bool):
-    """ set up scanning droplet cell client loading from CONFIG_FILE """
-
+    """Set up scanning droplet cell client loading from CONFIG_FILE."""
     experiment_root, _ = os.path.split(config_file)
 
     with open(config_file, "r") as f:
@@ -1654,7 +1678,16 @@ def sdc_client(config_file: str, resume: bool, zmq_pub: bool, verbose: bool):
 
 
 if __name__ == "__main__":
+    """Command-line entry point for interactive SDC work.
 
+    Example
+    ```shell
+    ipython -i asdc/localclient.py experiments/test/config.yaml -- --verbose
+    ```
+
+    The extra `--` is needed so that `ipython` passes long flags to the script
+    instead of trying to interpret them as arguments to the interpreter itself.
+    """
     parser = argparse.ArgumentParser(description="SDC client")
     parser.add_argument("configfile", type=str, help="config file")
     parser.add_argument(

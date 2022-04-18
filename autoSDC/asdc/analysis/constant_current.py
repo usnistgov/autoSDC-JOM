@@ -9,29 +9,24 @@ from asdc.analysis.echem_data import EchemData
 logger = logging.getLogger(__name__)
 
 
-class LSVData(EchemData):
+class ConstantCurrentData(EchemData):
     @property
     def _constructor(self):
-        return LSVData
+        return ConstantCurrentData
 
     @property
     def name(self):
-        return "LSV"
+        return "ConstantCurrent"
 
     def check_quality(self):
-        """ LSV heuristics: not implemented. """
+        """ Potentiostatic heuristics: not implemented. """
         return True
 
     def plot(self, fit=False):
-        """ plot LSV: current vs potential """
+        """ plot Constant Current:  potential vs time """
         # # super().plot('current', 'potential')
-
-        abscurrent = np.abs(self["current"])
-        abscurrent = np.clip(abscurrent, 1e-9, None)
-        log_i = np.log10(abscurrent)
-
-        plt.plot(self["potential"], log_i)
-        plt.xlabel("potential (V)")
-        plt.ylabel("log current (A)")
+        plt.plot(self["elapsed_time"], self["potential"])
+        plt.xlabel("elapsed time (s)")
+        plt.ylabel("potential (V)")
 
         plt.tight_layout()

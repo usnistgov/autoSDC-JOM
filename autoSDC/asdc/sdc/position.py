@@ -30,6 +30,10 @@ from System.Net import IPAddress
 from SolartronAnalytical.DeviceInterface.NanomotionXCD import XCD, XcdSettings
 
 
+# stage limits in meters
+LIMITS = {"x": (0, 0.1), "y": (0, 0.1), "z": (0, 0.1)}
+
+
 @contextmanager
 def controller(ip=CONTROLLER_ADDRESS, speed=1e-4):
     """ context manager that wraps position controller class Position. """
@@ -47,7 +51,7 @@ def controller(ip=CONTROLLER_ADDRESS, speed=1e-4):
 
 
 @contextmanager
-def sync_z_step(ip=CONTROLLER_ADDRESS, height=None, speed=1e-4):
+def sync_z_step(ip=CONTROLLER_ADDRESS, height=None, speed=1e-4, revert=True):
     """wrap position controller context manager
 
     perform vertical steps before lateral cell motion with the ctx manager
@@ -67,7 +71,7 @@ def sync_z_step(ip=CONTROLLER_ADDRESS, height=None, speed=1e-4):
             yield pos
 
         finally:
-            if height is not None:
+            if revert and height is not None:
                 dz = baseline_z - pos.z
                 pos.update_z(delta=dz)
 
@@ -197,6 +201,11 @@ class Position:
         """ the current stage z position """
         return self.current_position()[2]
 
+    @z.setter
+    def z(self, value):
+        """ directly set the stage z position """
+        self.update_z(delta=value - self.z)
+
     def current_position(self):
         """return the current coordinates as a list
 
@@ -204,7 +213,7 @@ class Position:
         """
         return [axis.Values[0] for axis in self.controller.Parameters]
 
-    def home(block_interval=1):
+    def home(self, block_interval=1):
         """execute the homing operation, blocking for `block_interval` seconds.
 
         Warning: this will cause the motion stage to return to it's origin.
@@ -290,6 +299,16 @@ class Position:
         step_height: ease off vertically before updating position
         poll_interval: busy-waiting polling interval (seconds)
         """
+
+        if len(delta) == 2:
+            delta = [delta[0], delta[1], 0]
+
+        # check setpoint against stage limits.
+        initial_position = np.array(self.current_position())
+        setpoint = initial_position + np.array(delta)
+        for s, (axis, limits) in zip(setpoint, LIMITS.items()):
+            if s < limits[0] or s > limits[1]:
+                raise ValueError(f"setpoint {axis}={s} outside limits.")
 
         if step_height is not None and step_height > 0:
             step_height = abs(step_height)

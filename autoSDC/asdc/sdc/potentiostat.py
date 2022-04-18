@@ -90,19 +90,24 @@ class Potentiostat:
             print("OVERLOAD:", overload_status)
         return overload_status
 
-    def read_buffers(self, start=0):
+    def read_buffers(self, start: int = 0, eis_mode: bool = False):
         num_points = self.points_available() - start
 
-        return pd.DataFrame(
-            {
-                "current": self.current(start, num_points),
-                "potential": self.potential(start, num_points),
-                "elapsed_time": self.elapsed_time(start, num_points),
-                "applied_potential": self.applied_potential(start, num_points),
-                "current_range": self.current_range_history(start, num_points),
-                "segment": self.segment(start, num_points),
-            }
-        )
+        results = {
+            "current": self.current(start, num_points),
+            "potential": self.potential(start, num_points),
+            "elapsed_time": self.elapsed_time(start, num_points),
+            "applied_potential": self.applied_potential(start, num_points),
+            "current_range": self.current_range_history(start, num_points),
+            "segment": self.segment(start, num_points),
+        }
+
+        if eis_mode:
+            results["frequency"] = self.frequency(start, num_points)
+            results["impedance_real"] = self.impedance_real(start, num_points)
+            results["impedance_imag"] = self.impedance_imag(start, num_points)
+
+        return pd.DataFrame(results)
 
     def run(self, experiment, clear=True):
         """ run an SDC experiment sequence -- busy wait until it's finished """
@@ -115,6 +120,11 @@ class Potentiostat:
         # this way, an `SDCSequence` can call all the individual `setup` methods
 
         argstring = experiment.setup(self.instrument.Experiment)
+
+        # configure data collection with extra tracked variables for EIS
+        eis_mode = False
+        if "EIS" in experiment.name:
+            eis_mode = True
 
         metadata = {"timestamp_start": datetime.now(), "parameters": argstring}
         self.start()
@@ -131,16 +141,22 @@ class Potentiostat:
         # send_data = source.sink(lambda x: socket.send_pyobj(x))
 
         # streaming dataframe for early stopping (and potential error checking) callbacks
-        example = pd.DataFrame(
-            {
-                "current": [],
-                "potential": [],
-                "elapsed_time": [],
-                "applied_potential": [],
-                "current_range": [],
-                "segment": [],
-            }
-        )
+
+        template = {
+            "current": [],
+            "potential": [],
+            "elapsed_time": [],
+            "applied_potential": [],
+            "current_range": [],
+            "segment": [],
+        }
+        if eis_mode:
+            template.update(
+                {"frequency": [], "impedance_real": [], "impedance_imag": []}
+            )
+
+        example = pd.DataFrame(template)
+
         sdf = DataFrame(source, example=example)
         early_stop = experiment.register_early_stopping(sdf)
 
@@ -149,7 +165,7 @@ class Potentiostat:
         while self.sequence_running():
             time.sleep(self.poll_interval)
             error_codes.add(self.check_overload())
-            data_chunk = self.read_buffers(start=data_cursor)
+            data_chunk = self.read_buffers(start=data_cursor, eis_mode=eis_mode)
             chunksize, _ = data_chunk.shape
             data_cursor += chunksize
 
@@ -477,6 +493,45 @@ class Potentiostat:
             num_points = num_points - start
 
         values = self.instrument.Experiment.GetDataCurrentRange(start, num_points)
+
+        if as_list:
+            return [value for value in values]
+
+        return values
+
+    def frequency(self, start=0, num_points=None, as_list=True):
+
+        if num_points is None:
+            num_points = self.points_available()
+            num_points = num_points - start
+
+        values = self.instrument.Experiment.GetDataFrequency(start, num_points)
+
+        if as_list:
+            return [value for value in values]
+
+        return values
+
+    def impedance_real(self, start=0, num_points=None, as_list=True):
+
+        if num_points is None:
+            num_points = self.points_available()
+            num_points = num_points - start
+
+        values = self.instrument.Experiment.GetDataImpedanceReal(start, num_points)
+
+        if as_list:
+            return [value for value in values]
+
+        return values
+
+    def impedance_imag(self, start=0, num_points=None, as_list=True):
+
+        if num_points is None:
+            num_points = self.points_available()
+            num_points = num_points - start
+
+        values = self.instrument.Experiment.GetDataImpedanceImaginary(start, num_points)
 
         if as_list:
             return [value for value in values]
