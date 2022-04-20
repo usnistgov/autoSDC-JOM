@@ -150,11 +150,14 @@ def model_quality(X, y, dx=1.0, ls=None, likelihood="beta", optimize=True):
         lik = gpflow.likelihoods.Bernoulli()
 
     model = gpflow.models.VGP(
-        data=(X, y), kernel=gpflow.kernels.RBF(lengthscales=ls), likelihood=lik
+        data=(X, y),
+        kernel=gpflow.kernels.RBF(lengthscales=ls) + gpflow.kernels.White(),
+        likelihood=lik,
     )
 
-    model.kernel.variance.prior = tfd.Gamma(f64(2), f64(1 / 2))
-    model.kernel.lengthscales.prior = tfd.Gamma(f64(2.0), f64(2 * dx / 3))
+    # model.kernel.variance.prior = tfd.Gamma(f64(2), f64(1 / 2))
+    # model.kernel.lengthscales.prior = tfd.Gamma(f64(2.0), f64(2 * dx / 3))
+    # model.likelihood.variance = 0.1
 
     if optimize:
         optimizer.minimize(
